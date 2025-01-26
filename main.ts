@@ -1,456 +1,545 @@
-const { createClient } = require('@supabase/supabase-js');
-const { ethers } = require("ethers");
+/***************************************************
+ * indexer.ts
+ ***************************************************/
+const { ethers, BigNumber } = require("ethers");
+const { createClient, SupabaseClient } = require("@supabase/supabase-js");
+const dotenv = require("dotenv");
+
+// ABIファイル(ビルド済)のimport例
 const factoryArtifact = require("./EtherFunFactory.json");
 const saleArtifact = require("./EtherfunSale.json");
-import dotenv from 'dotenv';
+
+// .env 読み込み
 dotenv.config();
 
+// ======================= ENV & CONFIG =======================
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const factoryAddress = process.env.FACTORY_ADDRESS;
-const uniswapFactoryAddress = process.env.UNISWAP_FACTORY_ADDRESS;
+
 if (!supabaseUrl || !supabaseServiceRoleKey || !factoryAddress) {
-  throw new Error('Supabase URL or Service Role Key or Factory Address is not set');
+  throw new Error("Missing required environment variables.");
 }
 
+// Supabase クライアント
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
-const provider = new ethers.providers.JsonRpcProvider("https://sepolia.infura.io/v3/4d95e2bfc962495dafdb102c23f0ec65");
-const factory = new ethers.Contract(factoryAddress, factoryArtifact.abi, provider);
 
-interface SaleData {
-    id: number;                    // int8
-    created_at: string;           // timestamptz
-    saleContractAddress: string;  // text
-    creator: string;              // text
-    name: string;                 // text
-    symbol: string;               // text
-    logoUrl: string;              // text
-    websiteUrl: string;          // text
-    twitterUrl: string;          // text
-    telegramUrl: string;         // text
-    description: string;         // text
-    blockNumber?: string;         // text
-    transactionHash?: string;     // text
-    totalRaised?: string;         // text
-    launched?: boolean;           // bool
-    positiveToken?: string;       // text
-    negativeToken?: string;       // text
-    positivePairAddress: string;        // text
-    negativePairAddress: string;        // text
+// WebSocket RPCプロバイダ (Infura例: wss)
+const provider = new ethers.providers.WebSocketProvider(
+  "wss://arbitrum-sepolia.infura.io/ws/v3/63b354d57387411191e8c4819970577b"
+);
+
+/**
+ * イベント引数の型定義例
+ */
+interface SaleCreatedEventArgs {
+  saleContractAddress: string;
+  creator: string;
+  name: string;
+  symbol: string;
+  saleGoal: typeof BigNumber;
+  logoUrl: string;
+  description: string;
+  // relatedLinksは無視
 }
 
-// プロバイダーの接続確認
-provider.on("block", (blockNumber: any) => {
-    console.log("New block:", blockNumber);
-});
+interface SaleLaunchedEventArgs {
+  saleContractAddress: string;
+  launcher: string;
+}
 
-console.log("Listening to events...", "[ SaleCreated, SaleLaunched, TokensBought, TokensSold, MetaUpdated]");
+interface TokensBoughtEventArgs {
+  saleContractAddress: string;
+  buyer: string;
+  totalRaised: typeof BigNumber;
+  tokenBalance: typeof BigNumber;
+}
 
-factory.on("SaleCreated", async (
-    saleContractAddress: string,
-    creator: string,
-    name: string,
-    symbol: string,
-    saleGoal: any, 
-    logoUrl: string,
-    websiteUrl: string,
-    twitterUrl: string,
-    telegramUrl: string,
-    description: string,
-    relatedLinks: string[],
-    event: any
-) => {
-    console.log("SaleCreated event detected", {
-        saleContractAddress,
-        creator,
-        name,
-        symbol,
-        logoUrl,
-        websiteUrl,
-        twitterUrl,
-        telegramUrl,
-        description,
-        blockNumber: event.blockNumber,
-        transactionHash: event.transactionHash
-    });
+interface TokensSoldEventArgs {
+  saleContractAddress: string;
+  seller: string;
+  totalRaised: typeof BigNumber;
+  tokenBalance: typeof BigNumber;
+}
 
-    const saleData: SaleData = {
-        id: Date.now(),
-        created_at: new Date().toISOString(),
-        saleContractAddress,
-        creator,
-        name,
-        symbol,
-        logoUrl,
-        websiteUrl,
-        twitterUrl,
-        telegramUrl,
-        description,
-        blockNumber: event.blockNumber?.toString(),
-        transactionHash: event.transactionHash,
-        positivePairAddress: "",
-        negativePairAddress: ""
-    };
+interface MetaUpdatedEventArgs {
+  saleContractAddress: string;
+  logoUrl: string;
+  description: string;
+}
 
-    const { error } = await supabase.from("saleData").insert(saleData);
-    if (error) console.error("Error inserting SaleCreated data:", error);
-    else console.log("SaleCreated event inserted into supabase");
-});
+interface ClaimedEventArgs {
+  saleContractAddress: string;
+  claimant: string;
+}
 
-factory.on("SaleLaunched", async (
-    saleContractAddress: string,
-    launcher: string,
-    event: any
-) => {
-    console.log("SaleLaunched event detected:", { saleContractAddress, launcher });
+// ======================= テーブルスキーマ =======================
 
-    try {
-        const saleContract = new ethers.Contract(saleContractAddress, saleArtifact.abi, provider);
-        
-        const { data: saleData, error: fetchError } = await supabase
-            .from("saleData")
-            .select("*")
-            .eq("saleContractAddress", saleContractAddress)
-            .single();
-            
-        if (fetchError) throw fetchError;
+/**
+ * Newsテーブル (idはDB側でauto increment, onchainAddressが一意)
+ */
+interface NewsSchema {
+  id?: number;           // auto-increment PK
+  onchainAddress: string; // コントラクトアドレス(文字列)
+  date?: string;         // 日付を文字列で保存
+  title?: string;
+  description?: string;
+  imageUrl?: string;
+  isLaunched?: boolean;
+}
 
+/**
+ * TokenDataテーブル (idはDB側でauto increment, onchainAddressが一意)
+ */
+interface VolumeHistoryItem {
+  time: number;   // ms単位のtimestamp
+  volume: number; // ETHでの合計調達額など
+}
 
-        const [totalRaised, launched, positiveToken, negativeToken] = await Promise.all([
-            saleContract.totalRaised(),
-            saleContract.launched(),
-            saleContract.positiveToken(),
-            saleContract.negativeToken(),
+interface TokenDataSchema {
+  id?: number;             // auto-increment PK
+  onchainAddress: string;  // コントラクトアドレス(文字列)
+  volume?: number;         
+  volumeHistory?: VolumeHistoryItem[];
+}
+
+// ======================= テーブル名 =======================
+const newsTableName = "News";
+const tokenDataTableName = "TokenData";
+
+// ======================= コントラクトインスタンス =======================
+const factory = new ethers.Contract(factoryAddress, factoryArtifact, provider);
+
+/**
+ * ブロックからtimestamp(ms)を取得する
+ * block.timestamp は秒単位なのでミリ秒に変換
+ */
+async function getBlockTimestampMs(event: Event): Promise<number> {
+  return new Date().getTime();
+}
+
+/**
+ * Newsテーブルに新規登録する（SaleCreated時）
+ * - 既に同onchainAddressのレコードがあれば何もしない
+ */
+async function insertNewsOnSaleCreated(
+  saleContractAddress: string,
+  blockTimestampMs: number,
+  name: string,
+  description: string,
+  logoUrl: string
+): Promise<void> {
+  const addressLower = saleContractAddress.toLowerCase();
+
+  // すでにレコードが存在するかチェック
+  const { data: existing, error: fetchError } = await supabase
+    .from(newsTableName)
+    .select("*")
+    .eq("onchainAddress", addressLower)
+    .maybeSingle();
+
+  if (fetchError) {
+    console.error("Error checking existing News record:", fetchError);
+    return;
+  }
+
+  if (existing) {
+    console.log(`[News] Already exists for onchainAddress=${addressLower}. Skip insertion.`);
+    return;
+  }
+
+  // 存在しなければINSERT
+  const { error: insertError } = await supabase
+    .from(newsTableName)
+    .insert([
+      {
+        onchainAddress: addressLower,
+        date: String(blockTimestampMs),  // 文字列で保存 (必要に応じて toISOString() 等も可)
+        title: name,
+        description: description,
+        imageUrl: logoUrl,
+        isLaunched: false,
+      }
+    ]);
+
+  if (insertError) {
+    console.error("insertNewsOnSaleCreated error:", insertError);
+  } else {
+    console.log(`[News] Inserted new record for onchainAddress=${addressLower}`);
+  }
+}
+
+/**
+ * TokenDataテーブルに新規登録する (SaleCreated時)
+ * - 既存があれば何もしない
+ */
+async function insertTokenDataOnSaleCreated(
+  saleContractAddress: string
+): Promise<void> {
+  const addressLower = saleContractAddress.toLowerCase();
+
+  // すでにレコードが存在するかチェック
+  const { data: existing, error: fetchError } = await supabase
+    .from(tokenDataTableName)
+    .select("*")
+    .eq("onchainAddress", addressLower)
+    .maybeSingle();
+
+  if (fetchError) {
+    console.error("Error checking existing TokenData record:", fetchError);
+    return;
+  }
+
+  if (existing) {
+    console.log(`[TokenData] Already exists for onchainAddress=${addressLower}. Skip insertion.`);
+    return;
+  }
+
+  // 存在しなければINSERT
+  const { error: insertError } = await supabase
+    .from(tokenDataTableName)
+    .insert([
+      {
+        onchainAddress: addressLower,
+        volume: 0,
+        volumeHistory: [],
+      }
+    ]);
+
+  if (insertError) {
+    console.error("insertTokenDataOnSaleCreated error:", insertError);
+  } else {
+    console.log(`[TokenData] Inserted new record for onchainAddress=${addressLower}`);
+  }
+}
+
+/**
+ * SaleLaunchedイベント: Newsテーブルの isLaunched = true に更新
+ */
+async function updateNewsIsLaunched(saleContractAddress: string): Promise<void> {
+  const addressLower = saleContractAddress.toLowerCase();
+
+  const { error } = await supabase
+    .from(newsTableName)
+    .update({ isLaunched: true })
+    .eq("onchainAddress", addressLower);
+
+  if (error) {
+    console.error("updateNewsIsLaunched error:", error);
+  } else {
+    console.log(`[News] isLaunched=true for onchainAddress=${addressLower}`);
+  }
+}
+
+/**
+ * TokensBought / TokensSoldイベント:
+ * TokenDataテーブルの volume, volumeHistory を更新
+ */
+async function updateTokenDataVolume(
+  saleContractAddress: string,
+  totalRaised: typeof BigNumber,
+  blockTimestampMs: number
+): Promise<void> {
+  try {
+    const addressLower = saleContractAddress.toLowerCase();
+    // wei -> Ether単位の number に変換
+    const newVolumeEther = parseFloat(ethers.utils.formatEther(totalRaised));
+
+    // 既存レコードを取得
+    const { data: existing, error: fetchError } = await supabase
+      .from(tokenDataTableName)
+      .select("*")
+      .eq("onchainAddress", addressLower)
+      .maybeSingle();
+
+    if (fetchError) {
+      console.error("Supabase fetch error (TokenData):", fetchError);
+      return;
+    }
+
+    if (!existing) {
+      // まだ存在しない => 新規insert
+      const volumeHistory: VolumeHistoryItem[] = [
+        { time: blockTimestampMs, volume: newVolumeEther }
+      ];
+      const { error: insertError } = await supabase
+        .from(tokenDataTableName)
+        .insert([
+          {
+            onchainAddress: addressLower,
+            volume: newVolumeEther,
+            volumeHistory
+          }
         ]);
 
-        const [positivePairAddress, negativePairAddress] = await getLaunchedDetails(positiveToken, negativeToken);
-
-
-        const { error: updateError } = await supabase
-            .from("saleData")
-            .update({
-                ...saleData,
-                launched,
-                totalRaised: totalRaised.toString(),
-                positiveToken,
-                negativeToken,
-                blockNumber: event.blockNumber?.toString(),
-                transactionHash: event.transactionHash,
-                positivePairAddress,
-                negativePairAddress
-            })
-            .eq("saleContractAddress", saleContractAddress);
-
-        if (updateError) throw updateError;
-    } catch (error) {
-        console.error("Error in SaleLaunched event:", error);
-    }
-});
-
-factory.on("TokensBought", async (
-  saleContractAddress: string,
-  buyer: string,
-  totalRaised: any,
-  tokenBalance: any,
-  event: any
-) => {
-  console.log("TokensBought event detected:", {
-      saleContractAddress,
-      buyer,
-      totalRaised: totalRaised.toString(),
-      tokenBalance: tokenBalance.toString()
-  });
-
-  try {
-      // まず既存のデータを確認
-      const { data: existingData } = await supabase
-          .from("saleData")
-          .select("*")
-          .eq("saleContractAddress", saleContractAddress)
-          .single();
-
-      if (!existingData) {
-          // データが存在しない場合、コントラクトから必要な情報を取得
-          const saleContract = new ethers.Contract(saleContractAddress, saleArtifact.abi, provider);
-          
-          try {
-              // 必要な情報を並行して取得
-              const [
-                  name,
-                  symbol,
-                  creator,
-                  launched,
-                  positiveToken,
-                  negativeToken,
-                  metadata
-              ] = await Promise.all([
-                  saleContract.name(),
-                  saleContract.symbol(),
-                  saleContract.creator(),
-                  saleContract.launched(),
-                  saleContract.positiveToken(),
-                  saleContract.negativeToken(),
-                  factory.getSaleMetadata(saleContractAddress)
-              ]);
-
-              // 新しいデータを作成
-              const newSaleData = {
-                  saleContractAddress,
-                  creator,
-                  name,
-                  symbol,
-                  logoUrl: metadata.logoUrl || "",
-                  websiteUrl: metadata.websiteUrl || "",
-                  twitterUrl: metadata.twitterUrl || "",
-                  telegramUrl: metadata.telegramUrl || "",
-                  description: metadata.description || "",
-                  blockNumber: event.blockNumber?.toString(),
-                  transactionHash: event.transactionHash,
-                  totalRaised: totalRaised.toString(),
-                  launched,
-                  positiveToken,
-                  negativeToken
-              };
-
-              // データを挿入
-              const { error: insertError } = await supabase
-                  .from("saleData")
-                  .insert(newSaleData);
-
-              if (insertError) throw insertError;
-              console.log(`Created new sale data for ${saleContractAddress}`);
-
-          } catch (error) {
-              console.error("Error fetching contract data:", error);
-              throw error;
-          }
+      if (insertError) {
+        console.error("Error inserting TokenData volume:", insertError);
       } else {
-          // 既存のデータを更新
-          const { error: updateError } = await supabase
-              .from("saleData")
-              .update({
-                  totalRaised: totalRaised.toString(),
-              })
-              .eq("saleContractAddress", saleContractAddress);
-
-          if (updateError) throw updateError;
-          console.log(`Updated sale data for ${saleContractAddress}`);
+        console.log(`[TokenData] Inserted new row for onchainAddress=${addressLower}`);
       }
-  } catch (error) {
-      console.error("Error processing TokensBought event:", error);
-  }
-});
+    } else {
+      // 既存 => volumeHistoryに追記してupdate
+      const oldHistory = existing.volumeHistory ?? [];
+      oldHistory.push({ time: blockTimestampMs, volume: newVolumeEther });
 
-factory.on("TokensSold", async (
-    saleContractAddress: string,
-    seller: string,
-    totalRaised: any,
-    tokenBalance: any,
-    event: any
-) => {
-    console.log("TokensSold event detected:", {
-        saleContractAddress,
-        seller,
-        totalRaised: totalRaised.toString(),
-        tokenBalance: tokenBalance.toString()
-    });
+      const { error: updateError } = await supabase
+        .from(tokenDataTableName)
+        .update({
+          volume: newVolumeEther,
+          volumeHistory: oldHistory
+        })
+        .eq("onchainAddress", addressLower);
 
-    try {
-        const { error } = await supabase
-            .from("saleData")
-            .update({
-                totalRaised: totalRaised.toString(),
-                blockNumber: event.blockNumber?.toString(),
-                transactionHash: event.transactionHash
-            })
-            .eq("saleContractAddress", saleContractAddress);
-
-        if (error) throw error;
-    } catch (error) {
-        console.error("Error in TokensSold event:", error);
-    }
-});
-
-factory.on("MetaUpdated", async (
-    saleContractAddress: string,
-    logoUrl: string,
-    websiteUrl: string,
-    twitterUrl: string,
-    telegramUrl: string,
-    description: string,
-    event: any
-) => {
-    console.log("MetaUpdated event detected:", {
-        saleContractAddress,
-        logoUrl,
-        websiteUrl,
-        twitterUrl,
-        telegramUrl,
-        description
-    });
-
-    try {
-        const { error } = await supabase
-            .from("saleData")
-            .update({
-                logoUrl,
-                websiteUrl,
-                twitterUrl,
-                telegramUrl,
-                description,
-                blockNumber: event.blockNumber?.toString(),
-                transactionHash: event.transactionHash
-            })
-            .eq("saleContractAddress", saleContractAddress);
-
-        if (error) throw error;
-    } catch (error) {
-        console.error("Error in MetaUpdated event:", error);
-    }
-});
-
-// エラーハンドリング
-provider.on("error", (error: any) => {
-    console.error("Provider error:", error);
-    // 必要に応じて再接続ロジックを実装
-});
-
-process.on("unhandledRejection", (error: any) => {
-    console.error("Unhandled promise rejection:", error);
-});
-
-
-async function syncHistoricalSales() {
-  console.log("🎉👍Starting historical sales sync...");
-  try {
-      // 過去のSaleCreatedイベントを取得
-      const filter = factory.filters.SaleCreated();
-      const events = await factory.queryFilter(filter, 7018959, 'latest');
-      console.log(`Found ${events.length} historical sales`);
-
-      for (const event of events) {
-          const saleContractAddress = event.args!.saleContractAddress;
-          
-          console.log(`Processing sale ${saleContractAddress}...`);
-
-          try {
-              // 既存のデータを確認
-              const { data: existingData } = await supabase
-                  .from("saleData")
-                  .select("*")
-                  .eq("saleContractAddress", saleContractAddress)
-                  .single();
-
-              // コントラクトインスタンスを作成
-              const saleContract = new ethers.Contract(saleContractAddress, saleArtifact.abi, provider);
-
-              // 必要なデータを取得
-              const [
-                  totalRaised,
-                  launched,
-                  positiveToken,
-                  negativeToken
-              ] = await Promise.all([
-                  saleContract.totalRaised(),
-                  saleContract.launched(),
-                  saleContract.positiveToken(),
-                  saleContract.negativeToken()
-              ]);
-
-              // Factoryからメタデータを取得
-              const metadata = await factory.getSaleMetadata(saleContractAddress);
-
-
-              const saleData = {
-                  saleContractAddress: saleContractAddress,
-                  creator: event.args!.creator,
-                  name: event.args!.name,
-                  symbol: event.args!.symbol,
-                  logoUrl: metadata.logoUrl,
-                  websiteUrl: metadata.websiteUrl,
-                  twitterUrl: metadata.twitterUrl,
-                  telegramUrl: metadata.telegramUrl,
-                  description: metadata.description,
-                  blockNumber: event.blockNumber.toString(),
-                  transactionHash: event.transactionHash,
-                  totalRaised: totalRaised.toString(),
-                  launched: launched,
-                  positiveToken: positiveToken,
-                  negativeToken: negativeToken
-              } as SaleData;
-
-              if (launched) {
-                const [positivePairAddress, negativePairAddress] = await getLaunchedDetails(positiveToken, negativeToken);
-                console.log("pairAddress", positivePairAddress, negativePairAddress);
-                saleData.positivePairAddress = positivePairAddress || "";
-                saleData.negativePairAddress = negativePairAddress || "";
-              }
-
-              if (existingData) {
-                  // 既存のデータを更新
-                  const { error: updateError } = await supabase
-                      .from("saleData")
-                      .update(saleData)
-                      .eq("saleContractAddress", saleContractAddress);
-
-                  if (updateError) {
-                      console.error(`Error updating sale ${saleContractAddress}:`, updateError);
-                      continue;
-                  }
-                  console.log(`Successfully updated sale ${saleContractAddress}`);
-              } else {
-                  // 新規データを挿入
-                  const { error: insertError } = await supabase
-                      .from("saleData")
-                      .insert(saleData);
-
-                  if (insertError) {
-                      console.error(`Error inserting sale ${saleContractAddress}:`, insertError);
-                      continue;
-                  }
-                  console.log(`Successfully inserted sale ${saleContractAddress}`);
-              }
-
-          } catch (error) {
-              console.error(`Error processing sale ${saleContractAddress}:`, error);
-              continue;
-          }
+      if (updateError) {
+        console.error("Error updating TokenData volume:", updateError);
+      } else {
+        console.log(`[TokenData] Updated volume for onchainAddress=${addressLower}`);
       }
-
-      console.log("Historical sales sync completed");
-  } catch (error) {
-      console.error("Error in syncHistoricalSales:", error);
-      throw error;
+    }
+  } catch (e) {
+    console.error("updateTokenDataVolume error:", e);
   }
 }
 
+/**
+ * MetaUpdatedイベント: Newsテーブルの imageUrl / description を更新
+ */
+async function updateNewsMetadata(
+  saleContractAddress: string,
+  logoUrl: string,
+  description: string
+): Promise<void> {
+  const addressLower = saleContractAddress.toLowerCase();
 
-async function getLaunchedDetails(positiveToken: string, negativeToken: string) {
-    const wethAddress = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14";
-    const FACTORY_ABI = ['function getPair(address tokenA, address tokenB) external view returns (address pair)'];
-    const factory = new ethers.Contract(uniswapFactoryAddress, FACTORY_ABI, provider);
-    const [positivePairAddress, negativePairAddress] = await Promise.all([
-      factory.getPair(positiveToken, wethAddress),
-      factory.getPair(negativeToken, wethAddress)
-    ]);
-    return [positivePairAddress, negativePairAddress];
-  }
+  const { error } = await supabase
+    .from(newsTableName)
+    .update({
+      imageUrl: logoUrl,
+      description: description,
+    })
+    .eq("onchainAddress", addressLower);
 
-
-
-// メインの初期化関数を修正
-async function initialize() {
-  try {
-      // 過去のデータを同期
-      await syncHistoricalSales();
-
-      // イベントリスナーを開始
-      console.log("Starting event listeners...");
-
-      console.log("Initialization completed");
-  } catch (error) {
-      console.error("Initialization failed:", error);
-      throw error;
+  if (error) {
+    console.error("updateNewsMetadata error:", error);
+  } else {
+    console.log(`[News] Updated metadata for onchainAddress=${addressLower}`);
   }
 }
 
+/**
+ * Claimedイベント: 必要に応じてDBへ記録する、またはログのみ
+ */
+async function handleClaimed(
+  saleContractAddress: string,
+  claimant: string
+): Promise<void> {
+  console.log(`[Claimed] onchainAddress=${saleContractAddress}, claimant=${claimant}`);
+  // 必要に応じて別テーブルに insert 等を実装
+}
+
+/**
+ * 過去イベントの同期例
+ */
+async function syncPastEvents(fromBlock: number, toBlock: number): Promise<void> {
+  console.log(`Syncing past events from block ${fromBlock} to block ${toBlock}...`);
+
+  // ============== SaleCreated ==============
+  const saleCreatedFilter = factory.filters.SaleCreated();
+  const saleCreatedEvents = await factory.queryFilter(saleCreatedFilter, fromBlock, toBlock);
+  for (const event of saleCreatedEvents) {
+    const args = event.args as unknown as SaleCreatedEventArgs;
+    if (!args) continue;
+    const blockTimestampMs = await getBlockTimestampMs(event);
+
+    await insertNewsOnSaleCreated(
+      args.saleContractAddress,
+      blockTimestampMs,
+      args.name,
+      args.description,
+      args.logoUrl
+    );
+
+    await insertTokenDataOnSaleCreated(args.saleContractAddress);
+  }
+
+  // ============== SaleLaunched ==============
+  const saleLaunchedFilter = factory.filters.SaleLaunched();
+  const saleLaunchedEvents = await factory.queryFilter(saleLaunchedFilter, fromBlock, toBlock);
+  for (const event of saleLaunchedEvents) {
+    const args = event.args as unknown as SaleLaunchedEventArgs;
+    if (!args) continue;
+
+    await updateNewsIsLaunched(args.saleContractAddress);
+  }
+
+  // ============== TokensBought ==============
+  const tokensBoughtFilter = factory.filters.TokensBought();
+  const tokensBoughtEvents = await factory.queryFilter(tokensBoughtFilter, fromBlock, toBlock);
+  for (const event of tokensBoughtEvents) {
+    const args = event.args as unknown as TokensBoughtEventArgs;
+    if (!args) continue;
+    const blockTimestampMs = await getBlockTimestampMs(event);
+
+    await updateTokenDataVolume(args.saleContractAddress, args.totalRaised, blockTimestampMs);
+  }
+
+  // ============== TokensSold ==============
+  const tokensSoldFilter = factory.filters.TokensSold();
+  const tokensSoldEvents = await factory.queryFilter(tokensSoldFilter, fromBlock, toBlock);
+  for (const event of tokensSoldEvents) {
+    const args = event.args as unknown as TokensSoldEventArgs;
+    if (!args) continue;
+    const blockTimestampMs = await getBlockTimestampMs(event);
+
+    await updateTokenDataVolume(args.saleContractAddress, args.totalRaised, blockTimestampMs);
+  }
+
+  // ============== MetaUpdated ==============
+  const metaUpdatedFilter = factory.filters.MetaUpdated();
+  const metaUpdatedEvents = await factory.queryFilter(metaUpdatedFilter, fromBlock, toBlock);
+  for (const event of metaUpdatedEvents) {
+    const args = event.args as unknown as MetaUpdatedEventArgs;
+    if (!args) continue;
+
+    await updateNewsMetadata(args.saleContractAddress, args.logoUrl, args.description);
+  }
+
+  // ============== Claimed ==============
+  const claimedFilter = factory.filters.Claimed();
+  const claimedEvents = await factory.queryFilter(claimedFilter, fromBlock, toBlock);
+  for (const event of claimedEvents) {
+    const args = event.args as unknown as ClaimedEventArgs;
+    if (!args) continue;
+
+    await handleClaimed(args.saleContractAddress, args.claimant);
+  }
+
+  console.log("Sync done.");
+}
+
+/**
+ * リアルタイムでイベントを購読
+ */
+function listenToEvents(): void {
+  // SaleCreated
+  factory.on(
+    "SaleCreated",
+    async (
+      saleContractAddress: string,
+      creator: string,
+      name: string,
+      symbol: string,
+      saleGoal: typeof BigNumber,
+      logoUrl: string,
+      description: string,
+      /* relatedLinks: string[], */
+      event: Event
+    ) => {
+      console.log("[Event] SaleCreated:", saleContractAddress);
+      const blockTimestampMs = await getBlockTimestampMs(event);
+
+      await insertNewsOnSaleCreated(
+        saleContractAddress,
+        blockTimestampMs,
+        name,
+        description,
+        logoUrl
+      );
+      await insertTokenDataOnSaleCreated(saleContractAddress);
+    }
+  );
+
+  // SaleLaunched
+  factory.on(
+    "SaleLaunched",
+    async (
+      saleContractAddress: string,
+      launcher: string,
+      event: Event
+    ) => {
+      console.log("[Event] SaleLaunched:", saleContractAddress);
+      await updateNewsIsLaunched(saleContractAddress);
+    }
+  );
+
+  // TokensBought
+  factory.on(
+    "TokensBought",
+    async (
+      saleContractAddress: string,
+      buyer: string,
+      totalRaised: typeof BigNumber,
+      tokenBalance: typeof BigNumber,
+      event: Event
+    ) => {
+      console.log("[Event] TokensBought:", saleContractAddress, " buyer=", buyer);
+      const blockTimestampMs = await getBlockTimestampMs(event);
+      await updateTokenDataVolume(saleContractAddress, totalRaised, blockTimestampMs);
+    }
+  );
+
+  // TokensSold
+  factory.on(
+    "TokensSold",
+    async (
+      saleContractAddress: string,
+      seller: string,
+      totalRaised: typeof BigNumber,
+      tokenBalance: typeof BigNumber,
+      event: Event
+    ) => {
+      console.log("[Event] TokensSold:", saleContractAddress, " seller=", seller);
+      const blockTimestampMs = await getBlockTimestampMs(event);
+      await updateTokenDataVolume(saleContractAddress, totalRaised, blockTimestampMs);
+    }
+  );
+
+  // MetaUpdated
+  factory.on(
+    "MetaUpdated",
+    async (
+      saleContractAddress: string,
+      logoUrl: string,
+      description: string,
+      event: Event
+    ) => {
+      console.log("[Event] MetaUpdated:", saleContractAddress);
+      await updateNewsMetadata(saleContractAddress, logoUrl, description);
+    }
+  );
+
+  // Claimed
+  factory.on(
+    "Claimed",
+    async (
+      saleContractAddress: string,
+      claimant: string,
+      event: Event
+    ) => {
+      console.log("[Event] Claimed:", saleContractAddress, " claimant=", claimant);
+      await handleClaimed(saleContractAddress, claimant);
+    }
+  );
+}
+
+/**
+ * トップレベルIIFEを使い、ファイル実行時に即監視を開始
+ */
+(async () => {
+  try {
+    console.log("=== Indexer Start ===");
+
+    // 1. 過去ブロックのイベント同期 (例: 過去5万ブロック分)
+    const latestBlock = await provider.getBlockNumber();
+    const fromBlock = Math.max(latestBlock - 50000, 0);
+    // await syncPastEvents(fromBlock, latestBlock);
+
+    // 2. リアルタイム監視開始
+    listenToEvents();
+
+    console.log(`Listening for new events from block > ${latestBlock} ...`);
+  } catch (err) {
+    console.error(err);
+    process.exit(1);
+  }
+})();
