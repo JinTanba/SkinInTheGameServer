@@ -1,3 +1,4 @@
+
 /***************************************************
  * indexer.ts
  ***************************************************/
@@ -23,10 +24,11 @@ if (!supabaseUrl || !supabaseServiceRoleKey || !factoryAddress) {
 
 // Supabase クライアント
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+const SEPOLIA_RPC_URL = "https://base-sepolia.g.alchemy.com/v2/k3Dvibh6qSOCk1KkssKyZub9r6AuK1qy";
 
 // WebSocket RPCプロバイダ (Infura例: wss)
-const provider = new ethers.providers.WebSocketProvider(
-  "wss://arbitrum-sepolia.infura.io/ws/v3/63b354d57387411191e8c4819970577b"
+const provider = new ethers.providers.JsonRpcProvider(
+  SEPOLIA_RPC_URL
 );
 
 /**
@@ -169,6 +171,86 @@ async function insertNewsOnSaleCreated(
   }
 }
 
+
+// async function (
+//   saleContractAddress: string,
+//   changedAddress: string,    // buyer or seller
+//   changedBalance: typeof BigNumber
+// ): Promise<void> {
+//   try {
+//     const addressLower = saleContractAddress.toLowerCase();
+
+//     // 1. 該当News(=onchainAddress) に対する全コメントを取得
+//     const { data: comments, error: commentsError } = await supabase
+//       .from("Comments")
+//       .select("*")
+//       .eq("newsId", addressLower);
+//     const isInclude = comments.some((comment) => comment.walletAddress.toLowerCase() === changedAddress.toLowerCase());
+//     if (!isInclude) {
+//       console.log(`[] No comments found for onchainAddress=${addressLower}`);
+//       return;
+//     }
+
+//     if (commentsError) {
+//       console.error("Error fetching comments:", commentsError);
+//       return;
+//     }
+//     if (!comments || comments.length === 0) {
+//       // コメントが一つも無い場合、best_commentの更新は不要
+//       console.log(`[] No comments found for onchainAddress=${addressLower}`);
+//       return;
+//     }
+
+
+//     // 2. saleContractインスタンスを生成し、各コメント投稿者の最新tokenBalanceを取得
+//     const saleContract = new ethers.Contract(addressLower, saleArtifact, provider);
+
+//     let bestComment: any | null = null;
+//     let bestBalance = ethers.BigNumber.from("0");
+
+//     for (const c of comments) {
+//       // コントラクト上の mapping(address => uint256) public tokenBalances から取得
+//       const walletBal = await saleContract.tokenBalances(c.walletAddress);
+//       const walletBalInEth = ethers.utils.formatEther(walletBal).toString();
+//       // tokenBalanceが最大のユーザーを探す
+//       if (walletBalInEth.gt(bestBalance)) {
+//         bestBalance = walletBalInEth;
+//         bestComment = c;
+//       }
+//     }
+
+//     if (!bestComment) {
+//       // いずれのコメント投稿者もbalanceが0だったなどの場合
+//       console.log(`[] No bestComment found (all zero or no valid comment) for onchainAddress=${addressLower}`);
+//       return;
+//     }
+
+//     // 3. best_comments に反映するデータを作成
+//     // Newsテーブルでは配列型の例になっているので、先頭要素1つだけを格納
+//     const bestCommentsPayload = [
+//       {
+//         content: bestComment.content,
+//         walletAddress: bestComment.walletAddress,
+//         position: "default",
+//       }
+//     ];
+
+//     // 4. Newsテーブルを更新
+//     const { error: updateError } = await supabase
+//       .from("News")
+//       .update({ best_comments: bestCommentsPayload })
+//       .eq("onchainAddress", addressLower);
+
+//     if (updateError) {
+//       console.error("Error updating News.best_comments:", updateError);
+//     } else {
+//       console.log(`[] Updated best_comments for onchainAddress=${addressLower} with wallet=${bestComment.walletAddress}`);
+//     }
+//   } catch (err) {
+//     console.error(" error:", err);
+//   }
+// }
+
 /**
  * TokenDataテーブルに新規登録する (SaleCreated時)
  * - 既存があれば何もしない
@@ -242,8 +324,8 @@ async function updateTokenDataVolume(
 ): Promise<void> {
   try {
     const addressLower = saleContractAddress.toLowerCase();
-    // wei -> Ether単位の number に変換
-    const newVolumeEther = parseFloat(ethers.utils.formatEther(totalRaised));
+    // ここをWei -> ETH変換するが、文字列として保持
+    const newVolumeEthString = ethers.utils.formatEther(totalRaised);
 
     // 既存レコードを取得
     const { data: existing, error: fetchError } = await supabase
@@ -260,14 +342,14 @@ async function updateTokenDataVolume(
     if (!existing) {
       // まだ存在しない => 新規insert
       const volumeHistory: VolumeHistoryItem[] = [
-        { time: blockTimestampMs, volume: newVolumeEther }
+        { time: blockTimestampMs, volume: newVolumeEthString }
       ];
       const { error: insertError } = await supabase
         .from(tokenDataTableName)
         .insert([
           {
             onchainAddress: addressLower,
-            volume: newVolumeEther,
+            volume: newVolumeEthString,
             volumeHistory
           }
         ]);
@@ -280,12 +362,12 @@ async function updateTokenDataVolume(
     } else {
       // 既存 => volumeHistoryに追記してupdate
       const oldHistory = existing.volumeHistory ?? [];
-      oldHistory.push({ time: blockTimestampMs, volume: newVolumeEther });
+      oldHistory.push({ time: blockTimestampMs, volume: newVolumeEthString });
 
       const { error: updateError } = await supabase
         .from(tokenDataTableName)
         .update({
-          volume: newVolumeEther,
+          volume: newVolumeEthString,
           volumeHistory: oldHistory
         })
         .eq("onchainAddress", addressLower);
@@ -341,7 +423,7 @@ async function handleClaimed(
  * 過去イベントの同期例
  */
 async function syncPastEvents(fromBlock: number, toBlock: number): Promise<void> {
-  console.log(`Syncing past events from block ${fromBlock} to block ${toBlock}...`);
+  console.log(`Syncing past events from block ${fromBlock} to block ${toBlock}...`  );
 
   // ============== SaleCreated ==============
   const saleCreatedFilter = factory.filters.SaleCreated();
@@ -446,6 +528,7 @@ function listenToEvents(): void {
         logoUrl
       );
       await insertTokenDataOnSaleCreated(saleContractAddress);
+      // await (saleContractAddress, creator, ethers.utils.formatEther(saleGoal).toString());
     }
   );
 
@@ -472,9 +555,10 @@ function listenToEvents(): void {
       tokenBalance: typeof BigNumber,
       event: Event
     ) => {
-      console.log("[Event] TokensBought:", saleContractAddress, " buyer=", buyer);
+      console.log("[Event] TokensBought:", saleContractAddress, " buyer=", buyer, " totalRaised=", ethers.utils.formatEther(totalRaised), " tokenBalance=", ethers.utils.formatEther(tokenBalance).toString());
       const blockTimestampMs = await getBlockTimestampMs(event);
       await updateTokenDataVolume(saleContractAddress, totalRaised, blockTimestampMs);
+      // await (saleContractAddress, buyer, ethers.utils.formatEther(tokenBalance).toString());
     }
   );
 
@@ -491,6 +575,8 @@ function listenToEvents(): void {
       console.log("[Event] TokensSold:", saleContractAddress, " seller=", seller);
       const blockTimestampMs = await getBlockTimestampMs(event);
       await updateTokenDataVolume(saleContractAddress, totalRaised, blockTimestampMs);
+      // await (saleContractAddress, seller, tokenBalance);
+
     }
   );
 
@@ -520,6 +606,134 @@ function listenToEvents(): void {
       await handleClaimed(saleContractAddress, claimant);
     }
   );
+}export async function getBestComment(
+  allComments: any[],
+  saleContract: any
+): Promise<any | null> {
+  let bestComment: any | null = null;
+  let bestBalance = BigNumber.from(0); // 比較用に 0 で初期化
+
+  for (const comment of allComments) {
+    try {
+      // コントラクトの mapping(address => uint256) public tokenBalances を呼び出し
+      const balanceBN: typeof BigNumber = await saleContract.tokenBalances(
+        comment.walletAddress
+      );
+
+      // 現在の最良バランスより大きいなら上書き
+      if (balanceBN.gt(bestBalance)) {
+        bestBalance = balanceBN;
+        bestComment = comment;
+      }
+      else if (balanceBN.eq(bestBalance) && bestComment !== null) {
+        const currentCreatedAt = new Date(comment.createdAt).getTime();
+        const bestCreatedAt = new Date(bestComment.createdAt).getTime();
+        if (currentCreatedAt > bestCreatedAt) {
+          bestComment = comment;
+        }
+      }
+    } catch (err) {
+      console.error(`Error fetching tokenBalance for ${comment.walletAddress}:`, err);
+    }
+  }
+
+  return bestComment;
+}
+
+/**
+ * Supabase の Realtime チャネルを購読し、Comments テーブルに INSERT があった際、
+ * 対象 News の best_comments を更新する
+ */
+export function listenToSupabaseComments(): void {
+  supabase
+    .channel("comments-channel") // 任意のチャンネル名
+    .on(
+      "postgres_changes",
+      {
+        event: "INSERT",
+        schema: "public",
+        table: "Comments",
+      },
+      async (payload: any) => {
+        try {
+          console.log("New comment inserted:", payload.new);
+          const newComment = payload.new;
+
+          // 1. 対象の News レコードを取得
+          const { data: existingNews, error: fetchNewsError } = await supabase
+            .from("News")
+            .select("*")
+            .eq("onchainAddress", newComment.newsId.toLowerCase())
+            .maybeSingle();
+
+          if (fetchNewsError) {
+            console.error("Error fetching News record:", fetchNewsError);
+            return;
+          }
+          if (!existingNews) {
+            console.log(`No News found for onchainAddress=${newComment.newsId}`);
+            return;
+          }
+
+          // 2. 該当ニュースに紐づくコメントを全取得（createdAt 降順）
+          const { data: allComments, error: commentsError } = await supabase
+            .from("Comments")
+            .select("*")
+            .eq("newsId", newComment.newsId.toLowerCase())
+            .order("createdAt", { ascending: false });
+
+          if (commentsError) {
+            console.error("Error fetching Comments:", commentsError);
+            return;
+          }
+          if (!allComments || allComments.length === 0) {
+            console.log(`No comments for newsId=${newComment.newsId}`);
+            return;
+          }
+
+
+          // 3. コントラクト呼び出しにより、「最も tokenBalance が大きいコメント」を探す
+          const saleContract = new ethers.Contract(
+            newComment.newsId, // News の onchainAddress (コントラクトアドレス)
+            saleArtifact,
+            provider
+          );
+
+          const bestComment = await getBestComment(allComments, saleContract);
+          if (!bestComment) {
+            console.log(
+              `All tokenBalances are 0 or error for onchainAddress=${newComment.newsId}`
+            );
+            return;
+          }
+
+          // 4. News.best_comments を更新
+          const bestCommentsPayload = [
+            {
+              content: bestComment.content,
+              walletAddress: bestComment.walletAddress,
+              position: "default",
+            },
+          ];
+
+          const { error: updateError } = await supabase
+            .from("News")
+            .update({ best_comments: bestCommentsPayload })
+            .eq("onchainAddress", newComment.newsId);
+
+          if (updateError) {
+            console.error("Error updating News.best_comments:", updateError);
+          } else {
+            console.log(
+              `[News] Updated best_comments for onchainAddress=${newComment.newsId} with wallet=${bestComment.walletAddress}`
+            );
+          }
+        } catch (e) {
+          console.error("Realtime comment handler error:", e);
+        }
+      }
+    )
+    .subscribe();
 }
 
 /**
@@ -536,10 +750,15 @@ function listenToEvents(): void {
 
     // 2. リアルタイム監視開始
     listenToEvents();
-
+    listenToSupabaseComments();
     console.log(`Listening for new events from block > ${latestBlock} ...`);
   } catch (err) {
     console.error(err);
     process.exit(1);
   }
 })();
+
+
+
+// 1bed988d95d77257ba84c5a548192914
+//MCTq8N-vAY8M8Rw72d5117qnrvA0p6wu4qTg4Qvx8Yd4AW_aVgAKaWYL7SG1lQr2pB6wRwcmEBYFLPMG684Uaw
